@@ -1,4 +1,3 @@
-/// <reference path="./types/express.d.ts" />
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -191,7 +190,6 @@ export async function startServer(): Promise<StartedServer> {
     if (!rawUrl) return undefined;
     try {
       const parsed = new URL(rawUrl);
-      // The URL API normalizes default ports like :80/:443 to "", so treat them as stable URLs.
       if (!parsed.port) return rawUrl;
       parsed.port = String(port);
       return parsed.toString();
@@ -237,26 +235,30 @@ export async function startServer(): Promise<StartedServer> {
     }
   
     const companyRows = await db.select({ id: companies.id }).from(companies);
-    for (const company of companyRows) {
-      const membership = await db
-        .select({ id: companyMemberships.id })
-        .from(companyMemberships)
-        .where(
-          and(
-            eq(companyMemberships.companyId, company.id),
-            eq(companyMemberships.principalType, "user"),
-            eq(companyMemberships.principalId, LOCAL_BOARD_USER_ID),
-          ),
-        )
-        .then((rows: Array<{ id: string }>) => rows[0] ?? null);
-      if (membership) continue;
-      await db.insert(companyMemberships).values({
-        companyId: company.id,
-        principalType: "user",
-        principalId: LOCAL_BOARD_USER_ID,
-        status: "active",
-        membershipRole: "owner",
-      });
+    const existingMemberships = await db
+      .select({ companyId: companyMemberships.companyId })
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, LOCAL_BOARD_USER_ID),
+        ),
+      );
+    const existingCompanyIds = new Set(existingMemberships.map((m: any) => m.companyId));
+    const missingCompanyIds = companyRows
+      .filter((c: any) => !existingCompanyIds.has(c.id))
+      .map((c: any) => c.id);
+
+    if (missingCompanyIds.length > 0) {
+      await db.insert(companyMemberships).values(
+        missingCompanyIds.map((companyId: string) => ({
+          companyId,
+          principalType: "user",
+          principalId: LOCAL_BOARD_USER_ID,
+          status: "active",
+          membershipRole: "owner",
+        }))
+      );
     }
   }
   
@@ -300,16 +302,6 @@ export async function startServer(): Promise<StartedServer> {
       logBuffer.append(message);
       if (!verboseEmbeddedPostgresLogs) {
         return;
-      }
-      const lines = typeof message === "string"
-        ? message.split(/\r?\n/)
-        : message instanceof Error
-          ? [message.message]
-          : [String(message ?? "")];
-      for (const lineRaw of lines) {
-        const line = lineRaw.trim();
-        if (!line) continue;
-        logger.info({ embeddedPostgresLog: line }, "embedded-postgres");
       }
     };
     const logEmbeddedPostgresFailure = (phase: "initialise" | "start", err: unknown) => {
@@ -405,7 +397,6 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         if (existsSync(postmasterPidFile)) {
-          logger.warn("Removing stale embedded PostgreSQL lock file");
           rmSync(postmasterPidFile, { force: true });
         }
         try {
@@ -552,7 +543,6 @@ export async function startServer(): Promise<StartedServer> {
     const label = trigger === "scheduled" ? "Automatic" : "Manual";
     try {
       logger.info({ backupDir: config.databaseBackupDir, trigger }, `${label} database backup starting`);
-      // Read retention from Instance Settings (DB) so changes take effect without restart.
       const generalSettings = await backupSettingsSvc.getGeneral();
       const retention = generalSettings.backupRetention;
 
@@ -620,9 +610,6 @@ export async function startServer(): Promise<StartedServer> {
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
-  // Increase keep-alive timeouts to safely outlive default idle timeouts
-  // of common reverse proxies and load balancers (like AWS ALB, Nginx, or Traefik).
-  // This prevents intermittent 502/ECONNRESET errors caused by Node's 5s default.
   server.keepAliveTimeout = 185000;
   server.headersTimeout = 186000;
   
@@ -673,8 +660,6 @@ export async function startServer(): Promise<StartedServer> {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
   
-    // Reap orphaned running runs at startup while in-memory execution state is empty,
-    // then resume any persisted queued runs that were waiting on the previous process.
     void heartbeat
       .reapOrphanedRuns()
       .then(() => heartbeat.promoteDueScheduledRetries())
@@ -739,8 +724,6 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "routine scheduler tick failed");
         });
   
-      // Periodically reap orphaned runs (5-min staleness threshold) and make sure
-      // persisted queued work is still being driven forward.
       void heartbeat
         .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
         .then(() => heartbeat.promoteDueScheduledRetries())
@@ -798,14 +781,10 @@ export async function startServer(): Promise<StartedServer> {
     );
     setInterval(() => {
       void runServerDatabaseBackup("scheduled").catch(() => {
-        // runServerDatabaseBackup already logs the failure with context.
       });
     }, backupIntervalMs);
   }
   
-  // Wait for external adapters to finish loading before accepting requests.
-  // Without this, adapter type validation (assertKnownAdapterType) would
-  // reject valid external adapter types during the startup loading window.
   const { waitForExternalAdapters } = await import("./adapters/registry.js");
   await waitForExternalAdapters();
 
